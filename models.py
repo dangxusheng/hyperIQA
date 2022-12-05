@@ -4,13 +4,27 @@ from torch.nn import functional as F
 from torch.nn import init
 import math
 import torch.utils.model_zoo as model_zoo
+from typing import Type, Any, Callable, Union, List, Optional
+from torch import Tensor
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
+    'resnet18_local': '/home/sunnypc/dangxs/projects/python_projects/pretrain_ckpt/resnet18-5c106cde.pth',
+
     'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
+    'resnet34_local': '/home/sunnypc/dangxs/projects/python_projects/pretrain_ckpt/resnet34-333f7ec4.pth',
+
     'resnet50': 'https://download.pytorch.org/models/resnet50-19c8e357.pth',
+    'resnet50_local': '/home/sunnypc/dangxs/projects/python_projects/pretrain_ckpt/resnet50-19c8e357.pth',
+
     'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth',
     'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
+
+    'resnext50_32x4d': 'https://download.pytorch.org/models/resnext50_32x4d-7cdf4587.pth',
+    'resnext101_32x8d': 'https://download.pytorch.org/models/resnext101_32x8d-8ba56ff5.pth',
+    'wide_resnet50_2': 'https://download.pytorch.org/models/wide_resnet50_2-95faca4d.pth',
+    'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
+
 }
 
 
@@ -29,9 +43,15 @@ class HyperNet(nn.Module):
         For size match, input args must satisfy: 'target_fc(i)_size * target_fc(i+1)_size' is divisible by 'feature_size ^ 2'.
 
     """
-    def __init__(self, lda_out_channels, hyper_in_channels, target_in_size, target_fc1_size, target_fc2_size, target_fc3_size, target_fc4_size, feature_size):
+
+    def __init__(self, lda_out_channels, hyper_in_channels, target_in_size, target_fc1_size, target_fc2_size,
+                 target_fc3_size, target_fc4_size, feature_size, backbone='resnet50', to_onnx=False):
         super(HyperNet, self).__init__()
 
+        assert backbone in ['resnet50', 'resnet18', 'resnet34']
+        # assert backbone == 'resnet50', '目前backbone只支持resnet50'
+
+        self.to_onnx_flag = to_onnx
         self.hyperInChn = hyper_in_channels
         self.target_in_size = target_in_size
         self.f1 = target_fc1_size
@@ -40,22 +60,37 @@ class HyperNet(nn.Module):
         self.f4 = target_fc4_size
         self.feature_size = feature_size
 
-        self.res = resnet50_backbone(lda_out_channels, target_in_size, pretrained=True)
+        out_channel_dict = {
+            'resnet50': 2048,
+            'resnet34': 512,
+            'resnet18': 512,
+        }
+
+        _output_ch = out_channel_dict[backbone]
+        if backbone == 'resnet50':
+            self.res = resnet50_backbone(lda_out_channels, target_in_size, pretrained=False)
+        elif backbone == 'resnet34':
+            self.res = resnet34_backbone(lda_out_channels, target_in_size, pretrained=False)
+        elif backbone == 'resnet18':
+            self.res = resnet18_backbone(lda_out_channels, target_in_size, pretrained=True)
+        else:
+            self.res = resnet50_backbone(lda_out_channels, target_in_size, pretrained=False)
 
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
 
         # Conv layers for resnet output features
         self.conv1 = nn.Sequential(
-            nn.Conv2d(2048, 1024, 1, padding=(0, 0)),
+            nn.Conv2d(_output_ch, _output_ch // 2, 1, padding=(0, 0)),
             nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 512, 1, padding=(0, 0)),
+            nn.Conv2d(_output_ch // 2, _output_ch // 4, 1, padding=(0, 0)),
             nn.ReLU(inplace=True),
-            nn.Conv2d(512, self.hyperInChn, 1, padding=(0, 0)),
+            nn.Conv2d(_output_ch // 4, self.hyperInChn, 1, padding=(0, 0)),
             nn.ReLU(inplace=True)
         )
 
         # Hyper network part, conv for generating target fc weights, fc for generating target fc biases
-        self.fc1w_conv = nn.Conv2d(self.hyperInChn, int(self.target_in_size * self.f1 / feature_size ** 2), 3,  padding=(1, 1))
+        self.fc1w_conv = nn.Conv2d(self.hyperInChn, int(self.target_in_size * self.f1 / feature_size ** 2), 3,
+                                   padding=(1, 1))
         self.fc1b_fc = nn.Linear(self.hyperInChn, self.f1)
 
         self.fc2w_conv = nn.Conv2d(self.hyperInChn, int(self.f1 * self.f2 / feature_size ** 2), 3, padding=(1, 1))
@@ -75,7 +110,7 @@ class HyperNet(nn.Module):
             if i > 2:
                 nn.init.kaiming_normal_(self._modules[m_name].weight.data)
 
-    def forward(self, img):
+    def f(self, img):
         feature_size = self.feature_size
 
         res_out = self.res(img)
@@ -114,14 +149,68 @@ class HyperNet(nn.Module):
         out['target_fc4b'] = target_fc4b
         out['target_fc5w'] = target_fc5w
         out['target_fc5b'] = target_fc5b
-
         return out
+
+    def forward(self, img):
+        if self.to_onnx_flag:
+            return self.onnx_forward(img)
+
+        return self.f(img)
+
+    def onnx_fc(self, input_, weight, bias):
+        input_re = input_.view(-1, input_.shape[0] * input_.shape[1], input_.shape[2], input_.shape[3])
+        weight_re = weight.view(weight.shape[0] * weight.shape[1], weight.shape[2],
+                                weight.shape[3], weight.shape[4])
+        bias_re = bias.view(bias.shape[0] * bias.shape[1])
+        out = F.conv2d(input=input_re, weight=weight_re, bias=bias_re, groups=weight.shape[0])
+        out = out.view(input_.shape[0], weight.shape[1], input_.shape[2], input_.shape[3])
+        return out
+
+    def onnx_forward(self, img):
+        out = self.f(img)
+        # return out
+        ########################################################################################
+        # replace TargetNet.forward()
+        # x = out['target_in_vec']
+        # for i in range(1, 6):
+        #     a = f'target_fc{i}w'
+        #     b = f'target_fc{i}b'
+        #     x = self.onnx_fc(x, out[a], out[b])
+        #     if i < 5: x = torch.sigmoid(x)
+        # x = torch.squeeze(x)
+        # return x
+
+        outs = [
+            out['target_in_vec'],
+            out['target_fc1w'], out['target_fc1b'],
+            out['target_fc2w'], out['target_fc2b'],
+            out['target_fc3w'], out['target_fc3b'],
+            out['target_fc4w'], out['target_fc4b'],
+            out['target_fc5w'], out['target_fc5b'],
+        ]
+        return self.postprocess(outs)
+
+    def postprocess(self, outs):
+        x = outs[0]
+        for i in range(1, 11, 2):
+            dim0 = x.shape[0]
+            dim2 = x.shape[2]
+            dim3 = x.shape[3]
+            x1 = torch.reshape(x, [-1, dim0 * x.shape[1], dim2, dim3])
+            w, b = outs[i], outs[i + 1]
+            w1 = torch.reshape(w, [w.shape[0] * w.shape[1], *w.shape[2:]])
+            b1 = b.reshape(-1)
+            x1 = torch.conv2d(x1, w1, b1, groups=w.shape[0])
+            x = torch.reshape(x1, [dim0, w.shape[1], dim2, dim3])
+            if i < 9:  x = torch.sigmoid(x)
+        return x
 
 
 class TargetNet(nn.Module):
     """
     Target network for quality prediction.
     """
+
     def __init__(self, paras):
         super(TargetNet, self).__init__()
         self.l1 = nn.Sequential(
@@ -161,19 +250,80 @@ class TargetFC(nn.Module):
         Weights & biases are different for different images in a batch,
         thus here we use group convolution for calculating images in a batch with individual weights & biases.
     """
+
     def __init__(self, weight, bias):
         super(TargetFC, self).__init__()
         self.weight = weight
         self.bias = bias
 
     def forward(self, input_):
-
         input_re = input_.view(-1, input_.shape[0] * input_.shape[1], input_.shape[2], input_.shape[3])
-        weight_re = self.weight.view(self.weight.shape[0] * self.weight.shape[1], self.weight.shape[2], self.weight.shape[3], self.weight.shape[4])
+        weight_re = self.weight.view(self.weight.shape[0] * self.weight.shape[1], self.weight.shape[2],
+                                     self.weight.shape[3], self.weight.shape[4])
         bias_re = self.bias.view(self.bias.shape[0] * self.bias.shape[1])
         out = F.conv2d(input=input_re, weight=weight_re, bias=bias_re, groups=self.weight.shape[0])
 
         return out.view(input_.shape[0], self.weight.shape[1], input_.shape[2], input_.shape[3])
+
+
+def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion: int = 1
+
+    def __init__(
+            self,
+            inplanes: int,
+            planes: int,
+            stride: int = 1,
+            downsample: Optional[nn.Module] = None,
+            groups: int = 1,
+            base_width: int = 64,
+            dilation: int = 1,
+            norm_layer: Optional[Callable[..., nn.Module]] = None
+    ) -> None:
+        super(BasicBlock, self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
 
 
 class Bottleneck(nn.Module):
@@ -216,6 +366,9 @@ class Bottleneck(nn.Module):
 
 
 class ResNetBackbone(nn.Module):
+    """
+    这是针对resnet50的通道配置
+    """
 
     def __init__(self, lda_out_channels, in_chn, block, layers, num_classes=1000):
         super(ResNetBackbone, self).__init__()
@@ -292,16 +445,28 @@ class ResNetBackbone(nn.Module):
         x = self.maxpool(x)
         x = self.layer1(x)
 
+        # print('1:', x.shape)
+        # print('1-pool:', self.lda1_pool(x).shape)
         # the same effect as lda operation in the paper, but save much more memory
         lda_1 = self.lda1_fc(self.lda1_pool(x).view(x.size(0), -1))
         x = self.layer2(x)
+        # print('2:', x.shape)
+        # print('2-pool:', self.lda2_pool(x).shape)
         lda_2 = self.lda2_fc(self.lda2_pool(x).view(x.size(0), -1))
         x = self.layer3(x)
+        # print('3:', x.shape)
+        # print('3-pool:', self.lda3_pool(x).shape)
         lda_3 = self.lda3_fc(self.lda3_pool(x).view(x.size(0), -1))
         x = self.layer4(x)
+        # print('4:', x.shape)
+        # print('4-pool:', self.lda4_pool(x).shape)
         lda_4 = self.lda4_fc(self.lda4_pool(x).view(x.size(0), -1))
 
+
         vec = torch.cat((lda_1, lda_2, lda_3, lda_4), 1)
+
+        # print(x.shape)      # [1,2048,7,7]
+        # print(vec.shape)    # [1,112]
 
         out = {}
         out['hyper_in_feat'] = x
@@ -318,7 +483,166 @@ def resnet50_backbone(lda_out_channels, in_chn, pretrained=False, **kwargs):
     """
     model = ResNetBackbone(lda_out_channels, in_chn, Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        save_model = model_zoo.load_url(model_urls['resnet50'])
+        # save_model = model_zoo.load_url(model_urls['resnet50'])
+
+        pretrained_path = model_urls['resnet50_local']
+        save_model = torch.load(pretrained_path)
+
+        model_dict = model.state_dict()
+        state_dict = {k: v for k, v in save_model.items() if k in model_dict.keys()}
+        model_dict.update(state_dict)
+        model.load_state_dict(model_dict)
+    else:
+        model.apply(weights_init_xavier)
+    return model
+
+
+class ResNet34_18_Backbone(nn.Module):
+    """
+    这是针对resnet34的通道配置
+    """
+
+    def __init__(self, lda_out_channels, in_chn, block, layers,num_classes=1000):
+        super(ResNet34_18_Backbone, self).__init__()
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        # 针对 224x224 输入分辨率的设置
+        _avg_pool2d = nn.AvgPool2d(7, stride=7)
+
+        # local distortion aware module
+        self.lda1_pool = nn.Sequential(
+            nn.Conv2d(64, 16, kernel_size=1, stride=1, padding=0, bias=False),
+            _avg_pool2d
+        )
+        self.lda1_fc = nn.Linear(16 * 64, lda_out_channels)
+
+        self.lda2_pool = nn.Sequential(
+            nn.Conv2d(128, 32, kernel_size=1, stride=1, padding=0, bias=False),
+            _avg_pool2d
+        )
+        self.lda2_fc = nn.Linear(32 * 16, lda_out_channels)
+
+        self.lda3_pool = nn.Sequential(
+            nn.Conv2d(256, 64, kernel_size=1, stride=1, padding=0, bias=False),
+            _avg_pool2d
+        )
+        self.lda3_fc = nn.Linear(64 * 4, lda_out_channels)
+
+        self.lda4_pool = _avg_pool2d
+        self.lda4_fc = nn.Linear(512, in_chn - lda_out_channels * 3)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+        # initialize
+        nn.init.kaiming_normal_(self.lda1_pool._modules['0'].weight.data)
+        nn.init.kaiming_normal_(self.lda2_pool._modules['0'].weight.data)
+        nn.init.kaiming_normal_(self.lda3_pool._modules['0'].weight.data)
+        nn.init.kaiming_normal_(self.lda1_fc.weight.data)
+        nn.init.kaiming_normal_(self.lda2_fc.weight.data)
+        nn.init.kaiming_normal_(self.lda3_fc.weight.data)
+        nn.init.kaiming_normal_(self.lda4_fc.weight.data)
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+
+        # print(x.shape)
+        # print(self.lda1_pool(x).shape)
+
+        # the same effect as lda operation in the paper, but save much more memory
+        lda_1 = self.lda1_fc(self.lda1_pool(x).view(x.size(0), -1))
+        x = self.layer2(x)
+        # print(self.lda2_pool(x).shape)
+        lda_2 = self.lda2_fc(self.lda2_pool(x).view(x.size(0), -1))
+        x = self.layer3(x)
+        # print(self.lda3_pool(x).shape)
+        lda_3 = self.lda3_fc(self.lda3_pool(x).view(x.size(0), -1))
+        x = self.layer4(x)
+        # print(self.lda4_pool(x).shape)
+        lda_4 = self.lda4_fc(self.lda4_pool(x).view(x.size(0), -1))
+
+        vec = torch.cat((lda_1, lda_2, lda_3, lda_4), 1)
+
+        # print(x.shape)  # [1,512,7,7]
+        # print(vec.shape)  # [1,112]
+
+        out = {}
+        out['hyper_in_feat'] = x
+        out['target_in_vec'] = vec
+
+        return out
+
+
+def resnet34_backbone(lda_out_channels, in_chn, pretrained=False, **kwargs):
+    """Constructs a ResNet-34 model_hyper.
+
+    Args:
+        pretrained (bool): If True, returns a model_hyper pre-trained on ImageNet
+    """
+    model = ResNet34_18_Backbone(lda_out_channels, in_chn, BasicBlock, [3, 4, 6, 3], **kwargs)
+    if pretrained:
+        # save_model = model_zoo.load_url(model_urls['resnet34'])
+
+        pretrained_path = model_urls['resnet34_local']
+        save_model = torch.load(pretrained_path)
+
+        model_dict = model.state_dict()
+        state_dict = {k: v for k, v in save_model.items() if k in model_dict.keys()}
+        model_dict.update(state_dict)
+        model.load_state_dict(model_dict)
+    else:
+        model.apply(weights_init_xavier)
+    return model
+
+
+def resnet18_backbone(lda_out_channels, in_chn, pretrained=False, **kwargs):
+    """Constructs a ResNet-18 model_hyper.
+
+    Args:
+        pretrained (bool): If True, returns a model_hyper pre-trained on ImageNet
+    """
+    model = ResNet34_18_Backbone(lda_out_channels, in_chn, BasicBlock, [2, 2, 2, 2], **kwargs)
+    # model = ResNet34_18_Backbone(lda_out_channels, in_chn, BasicBlock, [1, 1, 2, 1], **kwargs)
+    if pretrained:
+        # save_model = model_zoo.load_url(model_urls['resnet18'])
+
+        pretrained_path = model_urls['resnet18_local']
+        save_model = torch.load(pretrained_path)
+
         model_dict = model.state_dict()
         state_dict = {k: v for k, v in save_model.items() if k in model_dict.keys()}
         model_dict.update(state_dict)
@@ -337,5 +661,19 @@ def weights_init_xavier(m):
     elif classname.find('Linear') != -1:
         init.kaiming_normal_(m.weight.data)
     elif classname.find('BatchNorm2d') != -1:
-        init.uniform_(m.weight.data, 1.0, 0.02)
+        init.uniform_(m.weight.data, 0.02, 1.0)
         init.constant_(m.bias.data, 0.0)
+
+
+if __name__ == '__main__':
+    # m = resnet18_backbone(16, 112, pretrained=True)
+    # m = resnet34_backbone(16, 112, pretrained=True)
+    m = resnet50_backbone(16, 112, pretrained=True)
+    # m = HyperNet(16, 112, 224, 112, 56, 28, 14, 7, backbone='resnet50')
+    # m = HyperNet(16, 112, 224, 112, 56, 28, 14, 7, backbone='resnet34')
+    # m = HyperNet(16, 112, 224, 112, 56, 28, 14, 7, backbone='resnet18')
+    # m = HyperNet(16, 112, 112, 56, 28, 14, 7, 4, backbone='resnet18')
+
+    x = torch.randn(1, 3, 224, 224)
+    # x = torch.randn(1, 3, 224//2, 224//2)
+    _ = m(x)

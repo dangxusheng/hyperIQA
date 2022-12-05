@@ -5,7 +5,7 @@ import os.path
 import scipy.io
 import numpy as np
 import csv
-from openpyxl import load_workbook
+# from openpyxl import load_workbook
 
 
 class LIVEFolder(data.Dataset):
@@ -34,11 +34,15 @@ class LIVEFolder(data.Dataset):
 
         dmos = scipy.io.loadmat(os.path.join(root, 'dmos_realigned.mat'))
         labels = dmos['dmos_new'].astype(np.float32)
+        # TODO： label: [-2.64, 111.78]
+        # print('LIVE Labels: ', labels)
+        # print(np.max(labels), np.min(labels))
 
         orgs = dmos['orgs']
         refnames_all = scipy.io.loadmat(os.path.join(root, 'refnames_all.mat'))
         refnames_all = refnames_all['refnames_all']
 
+        refname.sort()
         sample = []
 
         for i in range(0, len(index)):
@@ -49,7 +53,6 @@ class LIVEFolder(data.Dataset):
             for j, item in enumerate(train_sel):
                 for aug in range(patch_num):
                     sample.append((imgpath[item], labels[0][item]))
-                # print(self.imgpath[item])
         self.samples = sample
         self.transform = transform
 
@@ -120,7 +123,6 @@ class LIVEChallengeFolder(data.Dataset):
 
 
 class CSIQFolder(data.Dataset):
-
     def __init__(self, root, index, transform, patch_num):
 
         refpath = os.path.join(root, 'src_imgs')
@@ -139,9 +141,14 @@ class CSIQFolder(data.Dataset):
             refnames_all.append(ref_temp[0] + '.' + ref_temp[-1])
 
         labels = np.array(target).astype(np.float32)
-        refnames_all = np.array(refnames_all)
+        # TODO： label: [0, 1]
+        # print('CSIQ Labels: ', labels)
+        # print(np.max(labels), np.min(labels))
 
+        refnames_all = np.array(refnames_all)
         sample = []
+        refname.sort(reverse=True)
+        # refnames_all.sort()
 
         for i, item in enumerate(index):
             train_sel = (refname[index[i]] == refnames_all)
@@ -149,7 +156,9 @@ class CSIQFolder(data.Dataset):
             train_sel = train_sel[0].tolist()
             for j, item in enumerate(train_sel):
                 for aug in range(patch_num):
-                    sample.append((os.path.join(root, 'dst_imgs_all', imgnames[item]), labels[item]))
+                    # sample.append((os.path.join(root, 'dst_imgs_all', imgnames[item]), labels[item]))
+                    _subdir = imgnames[item].split('.')[1].lower()
+                    sample.append((os.path.join(root, 'dst_imgs', _subdir, imgnames[item]), labels[item]))
         self.samples = sample
         self.transform = transform
 
@@ -219,6 +228,8 @@ class BIDFolder(data.Dataset):
         mos_all = []
 
         xls_file = os.path.join(root, 'DatabaseGrades.xlsx')
+
+        from openpyxl import load_workbook
         workbook = load_workbook(xls_file)
         booksheet = workbook.active
         rows = booksheet.rows
@@ -262,7 +273,6 @@ class BIDFolder(data.Dataset):
 
 
 class TID2013Folder(data.Dataset):
-
     def __init__(self, root, index, transform, patch_num):
         refpath = os.path.join(root, 'reference_images')
         refname = getTIDFileName(refpath,'.bmp.BMP')
@@ -279,7 +289,12 @@ class TID2013Folder(data.Dataset):
             ref_temp = words[1].split("_")
             refnames_all.append(ref_temp[0][1:])
         labels = np.array(target).astype(np.float32)
+        # TODO： label: [0.24, 7.22]
+        # print('TID2013 Labels: ', labels)
+        # print(np.max(labels), np.min(labels))
+
         refnames_all = np.array(refnames_all)
+        refname.sort()
 
         sample = []
         for i, item in enumerate(index):
